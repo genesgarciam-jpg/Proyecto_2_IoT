@@ -1,0 +1,131 @@
+#define BLYNK_TEMPLATE_ID "TMPL2U047QuB5"
+#define BLYNK_TEMPLATE_NAME "ESTACIÓN METEOROLÓGICA IoT DISTRIBUIDA"
+#define BLYNK_AUTH_TOKEN "llkkg-u0YETwFP7pzje3SQ3Pw1JdIkCv"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ThingSpeak.h>
+#include <BlynkSimpleEsp32.h>
+
+// --- CONFIGURA TUS CREDENCIALES AQUÍ ---
+const char* ssid = "AmoIott";       // Nombre de tu red Wi-Fi
+const char* password = "sinaiymary"; // Contraseña de tu red Wi-Fi
+
+// --- CONFIGURA TUS DATOS DE THINGSPEAK ---
+unsigned long myChannelNumber = 3578500;   // Tu Channel ID
+const char* myWriteAPIKey = "I5SWC3OV06FCJMAN"; // Tu Write API Key
+WiFiClient client;
+
+// Estructura idéntica y sincronizada del Payload recibido desde el emisor
+typedef struct struct_message {
+    char id[12];
+    float tempDHT;
+    float humDHT;
+    float pressure;
+    float tempBMP;
+    int light;
+    unsigned int sampleNum;
+} struct_message;
+
+struct_message incomingReadings;
+
+// Variables para supervisión de enlace (Online / Offline)
+unsigned long lastTimeReceived = 0;
+const unsigned long timeoutThreshold = 35000; // 35 segundos sin paquetes = Fuera de línea
+bool datosNuevosRecibidos = false;
+
+// Función callback que se ejecuta al recibir datos por ESP-NOW
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+    memcpy(&incomingReadings, incomingData, sizeof(incomingReadings));
+    lastTimeReceived = millis(); // Actualizar el cronometrador de última recepción
+    datosNuevosRecibidos = true;
+
+    Serial.println("\n--- Datos recibidos del Emisor por ESP-NOW ---");
+    Serial.printf("ID Nodo: %s\n", incomingReadings.id);
+    Serial.printf("Temperatura (DHT22): %.2f °C\n", incomingReadings.tempDHT);
+    Serial.printf("Humedad: %.2f %%\n", incomingReadings.humDHT);
+    Serial.printf("Presión: %.2f hPa\n", incomingReadings.pressure);
+    Serial.printf("Temperatura (BMP180): %.2f °C\n", incomingReadings.tempBMP);
+    Serial.printf("Iluminación: %d %%\n", incomingReadings.light);
+    Serial.printf("Muestra #: %u\n", incomingReadings.sampleNum);
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Conectar el Gateway a Internet vía Wi-Fi y Blynk
+    WiFi.mode(WIFI_STA);
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+    
+    Serial.print("Conectando el Gateway a Wi-Fi y Blynk");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\n¡Gateway conectado a Internet y Blynk exitosamente!");
+
+    ThingSpeak.begin(client);
+
+    // Inicializar ESP-NOW en el receptor
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error al inicializar ESP-NOW en el gateway");
+        return;
+    }
+
+    // Registrar la función que escuchará los paquetes entrantes
+    esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
+}
+
+void loop() {
+    Blynk.run(); // Mantiene la comunicación activa con la app de Blynk
+
+    // Evaluar estado del enlace (Supervisión Online / Offline)
+    unsigned long millisSinRecibir = millis() - lastTimeReceived;
+    bool isOnline = (millisSinRecibir < timeoutThreshold);
+    
+    // Calcular segundos desde el último paquete para V8
+    unsigned long segundosSinPaquete = millisSinRecibir / 1000;
+
+    // Actualizar datastreams de estado en Blynk en cada ciclo para monitoreo en tiempo real
+    Blynk.virtualWrite(V5, isOnline ? 255 : 0);                      // LED de estado (255 encendido, 0 apagado)
+    Blynk.virtualWrite(V6, isOnline ? "EN LÍNEA" : "FUERA DE LÍNEA"); // Estado de la conexión
+    Blynk.virtualWrite(V8, (int)segundosSinPaquete);                 // Segundos desde el último paquete
+
+    if (isOnline) {
+        Serial.println("Estado del sistema: EN LÍNEA (Comunicación activa con el emisor)");
+    } else {
+        Serial.println("Estado del sistema: FUERA DE LÍNEA (Esperando paquetes del emisor...)");
+    }
+
+    // Si hay internet y llegaron nuevos datos del emisor, despacharlos a las nubes
+    if (WiFi.status() == WL_CONNECTED && isOnline && datosNuevosRecibidos) {
+        datosNuevosRecibidos = false; // Consumir el indicador para enviar una vez por paquete
+
+        // 1. Enviar datos a ThingSpeak
+        ThingSpeak.setField(1, incomingReadings.tempDHT);
+        ThingSpeak.setField(2, incomingReadings.humDHT);
+        ThingSpeak.setField(3, incomingReadings.pressure);
+        ThingSpeak.setField(4, incomingReadings.light);
+        ThingSpeak.setField(5, incomingReadings.tempBMP);
+
+        int x = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+       
+        if (x == 200) {
+            Serial.println("¡Datos subidos exitosamente a ThingSpeak!");
+        } else {
+            Serial.println("Error al actualizar ThingSpeak. Código HTTP: " + String(x));
+        }
+
+        // 2. Enviar sensores y métricas completas a Blynk (V0 a V4, V9)
+        Blynk.virtualWrite(V0, incomingReadings.tempDHT);
+        Blynk.virtualWrite(V1, incomingReadings.humDHT);
+        Blynk.virtualWrite(V2, incomingReadings.pressure);
+        Blynk.virtualWrite(V3, incomingReadings.light);
+        Blynk.virtualWrite(V4, incomingReadings.tempBMP);
+        Blynk.virtualWrite(V9, (int)incomingReadings.sampleNum); // Número de muestras
+    }
+
+    delay(5000); // Revisión de estado cada 5 segundos para refrescar V8 y V6 con agilidad en Blynk
+}
